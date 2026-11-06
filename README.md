@@ -50,8 +50,9 @@ The POC runs the same three steps in the same order every time. That caused real
 
 ```mermaid
 flowchart LR
-    U[Patent attorney] --> UI[Streamlit UI<br/>Streamlit Community Cloud]
-    UI -->|HTTPS + X-API-Key| APIGW[API Gateway]
+    U[Patent attorney] --> UI[React web app<br/>AWS Amplify Hosting<br/>S3 + CloudFront]
+    UI -->|sign in| COG[Amazon Cognito<br/>user pool]
+    UI -->|HTTPS + Cognito JWT| APIGW[API Gateway<br/>Cognito authorizer]
     APIGW --> API[Lambda: run API<br/>POST /runs · GET /runs/id]
     API <-->|run state, results| DDB[(DynamoDB<br/>runs table, TTL)]
     API -->|InvokeAgentRuntime| RT
@@ -74,9 +75,11 @@ flowchart LR
 
 | Component | Role |
 |---|---|
-| **Streamlit UI** | Upload a PDF, start a run, show live progress, render results. Extracts PDF text client-side (as in the POC). Hosted on Streamlit Community Cloud. |
-| **API Gateway + run API Lambda** | Thin, fast API that starts a run and returns a `run_id`, then serves run status/results. Keeps the POC's `X-API-Key` auth. Never waits on the agent, so the 29-second limit stops mattering. |
-| **DynamoDB (runs table)** | One item per run: status, progress events, final structured report. TTL expires old runs. |
+| **React web app (TypeScript)** | Sign in, upload a PDF, start a run, show live progress, render the report and search log. Extracts PDF text in the browser with pdf.js. A static site with no servers. |
+| **AWS Amplify Hosting** | Hosts the web app (S3 + CloudFront under the hood) and rebuilds it on every push to the repo. |
+| **Amazon Cognito (user pool)** | Per-user sign-in. Issues JWTs that API Gateway verifies. Replaces the POC's single shared API key. |
+| **API Gateway + run API Lambda** | Thin, fast API that starts a run and returns a `run_id`, then serves run status/results. A Cognito authorizer protects every route. Never waits on the agent, so the 29-second limit stops mattering. |
+| **DynamoDB (runs table)** | One item per run, keyed by the user's Cognito `sub`: status, progress events, final structured report. TTL expires old runs. Users can only read their own runs. |
 | **AgentCore Runtime** | Hosts the agent as a container and runs it for as long as a run takes. Session isolation per run. |
 | **Strands Agents SDK** | The agent loop, tool definitions and structured output, written in Python. Runs locally and in AgentCore with the same code. |
 | **Amazon Bedrock** | Nova Pro as the reasoning model (swappable, see below). Titan Text Embeddings V2 (1024 dimensions) for vectors. |
@@ -90,7 +93,7 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant UI as Streamlit UI
+    participant UI as Web app (signed in)
     participant API as Run API (Lambda)
     participant DB as DynamoDB
     participant AG as Agent (AgentCore Runtime)
@@ -160,8 +163,10 @@ The final report is a Pydantic model, so the UI and tests depend on a fixed shap
 | Hosting | **Amazon Bedrock AgentCore Runtime** | Built for long-running agent sessions, which removes the API Gateway timeout problem. |
 | Model | **Amazon Nova Pro** (default) | Continuity with the POC. Strands allows swapping to another Bedrock model with a one-line change if Nova's tool-calling is weak. |
 | Embeddings / vector store | Titan V2 (1024-d) + Pinecone | Unchanged. No reason to churn. |
+| Frontend | **React + TypeScript on AWS Amplify Hosting** | Replaces Streamlit Community Cloud. Static, serverless, near-zero idle cost, and keeps everything in one AWS account. |
+| Auth | **Amazon Cognito** | Draft applications are confidential, so a shared API key is not enough. Per-user accounts and JWTs. |
 | Run API | API Gateway + Lambda + DynamoDB | Small, cheap, and keeps the UI decoupled from the agent runtime. |
-| IaC | **AWS CDK (Python)** for API, DynamoDB, secrets, ECR. | Proposed. The AgentCore Runtime deployment tool may be used for the runtime itself. |
+| IaC | **AWS CDK (Python)** for API, Cognito, DynamoDB, secrets, ECR. | Proposed. The AgentCore Runtime deployment tool may be used for the runtime itself. How to define the Amplify app (CDK or console) is undecided. |
 | Evaluation | RAGAS for retrieval quality, plus trajectory checks | See below. |
 
 The model, IaC choice and run-API shape are proposals, not settled decisions.
@@ -178,7 +183,9 @@ The POC's RAGAS scores were weak (answer relevancy 0.28, context recall 0.33) an
 
 ## Security
 
-- API Gateway requires an API key (carried over from the POC); CORS to be restricted to the Streamlit origin instead of `*`.
+- Users sign in through Cognito. API Gateway rejects requests without a valid JWT, and the run API only returns runs belonging to the caller's `sub`.
+- Self-signup is disabled in v1: accounts are created by an admin.
+- CORS is restricted to the web app's origin instead of `*`.
 - Agent runtime IAM role limited to: invoking the two Bedrock models, reading its secrets, writing to the runs table.
 - Secrets live in Secrets Manager, not in the image or environment files.
 - Uploaded patent text is stored only in the runs table, with a TTL.
@@ -190,8 +197,8 @@ The POC's RAGAS scores were weak (answer relevancy 0.28, context recall 0.33) an
 1. **Local agent.** Strands agent running locally with the existing functions as tools. Decide from real runs whether the agent beats the POC.
 2. **Hardening.** Guardrails, evidence validation, structured output, fixes to the claim parser and Pinecone scoping.
 3. **Evaluation.** Expanded golden set and trajectory checks.
-4. **AWS deployment.** AgentCore Runtime, run API, DynamoDB, Secrets Manager, observability, via CDK.
-5. **UI.** Update Streamlit to start runs, poll for progress, and render the report and search log.
+4. **AWS backend deployment.** AgentCore Runtime, run API, Cognito, DynamoDB, Secrets Manager, observability, via CDK.
+5. **Web app.** New React + TypeScript app on Amplify Hosting: sign in, upload a PDF, start a run, poll for progress, and render the report and search log. The Streamlit UI is retired.
 
 Deploy only if step 1 shows the agent is worth it.
 
@@ -206,11 +213,14 @@ This design was written from memory of AWS's agent services, not from current do
 - Invocation auth from a Lambda to AgentCore Runtime (IAM/SigV4 versus OAuth).
 - Whether Strands structured output works with Nova models.
 - Whether API Gateway is needed at all, or a Lambda Function URL would do.
+- Whether the browser could call AgentCore Runtime directly with a Cognito JWT, which would remove the Lambda and DynamoDB layer. This is not planned for v1: a closed tab would lose the run, and it is unclear whether AgentCore supports browser calls and streaming.
 
 ## Open questions
 
 - Should the agent's search also use CPC classification codes and applicant/inventor filters, not just keywords?
 - How should the UI show uncertainty when the search is inadequate?
+- Is pdf.js in the browser good enough for PDF text extraction, or should PDFs upload to S3 and be parsed server-side with the existing `pypdf` code? Scanned PDFs fail either way.
+- Will anyone other than you use this? If not, Cognito could be deferred, but the design assumes it from the start.
 - Is DynamoDB polling good enough, or is streaming worth the extra complexity?
 - How many input patents do we need in the golden set before evaluation results mean anything?
 
