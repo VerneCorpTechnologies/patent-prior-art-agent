@@ -1,0 +1,10 @@
+cat .gitignore
+venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+data/
+deployment/
+*.zip
+.streamlit/secrets.toml

@@ -1,0 +1,14 @@
+boto3
+langchain
+langchain-aws
+langchain-pinecone
+pinecone
+fastapi
+mangum
+requests
+python-dotenv
+pypdf
+pydantic
+ragas
+datasets
+streamlit
