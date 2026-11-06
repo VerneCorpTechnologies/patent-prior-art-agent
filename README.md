@@ -1,209 +1,233 @@
-# Patent Prior Art Search
-### Invention Extraction · Prior Art Retrieval · Claim Mapping
+# Patent Prior Art Agent
+### An agentic rebuild of the patent prior art search POC, on AWS
 
-A production-grade RAG system that automates patent prior art search before filing. A patent attorney inputs a patent application; the system extracts the core inventive concept in plain English, searches the EPO database for semantically similar prior art, and produces an element-by-element claim mapping with colour-coded novelty assessment.
+An AI agent that performs pre-filing prior art searches. A patent attorney gives it a draft application. The agent works out the core inventive concept, searches the EPO database, refines its search when results are thin, reads the most promising patents in full, and produces an element-by-element novelty assessment with verifiable evidence quotes.
 
-Built to reduce the cost and time of pre-filing patent searches — helping attorneys identify conflicts before submitting to the EPO, reducing rejection cycles and client costs.
+This is the successor to [patent-prior-art-rag](https://github.com/VerneCorpTechnologies/patent-prior-art-rag), a fixed Extract → Retrieve → Map pipeline. That POC proved the idea. This project replaces the fixed pipeline with an agent that decides what to do next.
+
+> **Status: design phase.** The code in `src/` is still the unchanged POC. This README is the target design; nothing described below as "the agent" exists yet.
 
 ---
 
-## The Problem
+## Why an agent
 
-Patent claims are deliberately written in broad, abstract legal language that obscures the core inventive concept. Comparing two patents manually requires an attorney to mentally extract the essence of both — a slow, expensive, and cognitively demanding process.
+The POC runs the same three steps in the same order every time. That caused real problems:
 
-This system automates that workflow in three steps:
+| POC problem | How the agent addresses it |
+|---|---|
+| The EPO search is a single CQL query of 3 keywords joined with `AND`. If it returns nothing, the run ends. | The agent inspects results and retries with broader or rephrased queries (bounded). |
+| Mapping only sees whatever top-k chunks Pinecone returned. | The agent can fetch a promising patent's full claim set before judging it. |
+| `/retrieve` ingests up to 10 patents synchronously and hits API Gateway's 29-second limit. | Runs are asynchronous: start a run, poll for progress and results. |
+| The Pinecone query is not scoped to this run's candidates, so stale chunks can leak in. | Semantic search is filtered to the candidate patent numbers. |
+| Evidence quotes come from the LLM and are never checked. | Quotes are validated in code against the retrieved source text. |
 
-```
-EXTRACT  →  RETRIEVE  →  MAP
-```
+**Honest trade-off:** agents are less predictable and cost more tokens than a fixed pipeline. The value here is concentrated in the search loop (retry, read deeper, stop when done). Everything else stays deterministic and is bounded by hard limits.
 
-1. **Extract** — Nova Pro reads the patent and extracts the inventive concept in plain English
-2. **Retrieve** — The extracted concept is embedded and used to search the EPO database for semantically similar prior art
-3. **Map** — Each prior art patent is compared element by element against the client's claims, with colour-coded novelty assessment
+---
+
+## Goals, non-goals, anti-goals
+
+**Goals**
+- Given a draft patent (PDF or text), produce a ranked list of relevant EP/GB prior art with element-by-element mapping and a risk level per patent.
+- Recover from weak searches without human help.
+- Show its work: every run has a trace of searches, tool calls and reasoning that an attorney can inspect.
+- Run serverlessly on AWS at near-zero idle cost.
+
+**Non-goals (v1)**
+- Legal advice or a freedom-to-operate opinion.
+- Patent offices beyond EPO OPS (EP and GB documents).
+- Multi-turn chat or long-term memory across sessions.
+- Multi-user accounts, billing, or tenancy.
+
+**Anti-goals (a failure even if it technically works)**
+- Presenting an invented or paraphrased quote as evidence.
+- Reporting "low risk" because a search found nothing, without saying the search may simply have been inadequate.
+- Unbounded loops or unbounded spend on a single run.
 
 ---
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    U[Patent attorney] --> UI[Streamlit UI<br/>Streamlit Community Cloud]
+    UI -->|HTTPS + X-API-Key| APIGW[API Gateway]
+    APIGW --> API[Lambda: run API<br/>POST /runs · GET /runs/id]
+    API <-->|run state, results| DDB[(DynamoDB<br/>runs table, TTL)]
+    API -->|InvokeAgentRuntime| RT
+
+    subgraph AC[Amazon Bedrock AgentCore]
+        RT[AgentCore Runtime<br/>Strands agent container]
+        OBS[AgentCore Observability]
+    end
+
+    RT -->|Converse API · tool use| BR[Amazon Bedrock<br/>Nova Pro + Titan Embeddings V2]
+    RT -->|search · fetch| EPO[EPO OPS API]
+    RT -->|upsert · query| PC[(Pinecone<br/>serverless)]
+    RT -->|progress + final report| DDB
+    RT -.-> SM[Secrets Manager<br/>Pinecone + EPO keys]
+    RT -.-> OBS
+    ECR[ECR<br/>agent image] -.-> RT
 ```
-Streamlit UI (Streamlit Community Cloud)
-        ↓
-AWS API Gateway → AWS Lambda (FastAPI + Mangum)
-        ↓                    ↓
-   AWS Bedrock            AWS S3
- (Nova Pro +           (Patent storage)
-  Titan Embed)
-        ↓
-     Pinecone
-  (Vector store)
-        ↓
-   EPO OPS API
- (Patent database)
-```
 
-### Key Design Decisions
+### Components
 
-**Concept-first retrieval** — The system embeds the *extracted inventive concept* rather than raw claim text. Patent claims are written to be broad and abstract — retrieving on that language finds patents that use similar legal phrasing, not patents that describe similar inventions.
-
-**Structure-aware chunking** — Each patent claim is treated as an atomic unit and never split. A naive text splitter would destroy the semantic integrity of patent claims by cutting mid-sentence.
-
-**Serverless backend** — AWS Lambda charges only per invocation with no idle server costs. The architecture scales automatically and costs ~$0 at demo scale.
-
----
-
-## Tech Stack
-
-| Component | Technology |
+| Component | Role |
 |---|---|
-| LLM | Amazon Nova Pro via AWS Bedrock |
-| Embeddings | Amazon Titan Text Embeddings V2 via AWS Bedrock |
-| Vector Store | Pinecone (free tier, serverless) |
-| Patent Data | EPO OPS API (GB, EP, PCT patents) |
-| Orchestration | LangChain |
-| Evaluation | RAGAS |
-| Backend | FastAPI + Mangum |
-| Frontend | Streamlit |
-| Deployment | AWS Lambda + API Gateway |
-| UI Hosting | Streamlit Community Cloud |
-| CI/CD | GitHub Actions |
+| **Streamlit UI** | Upload a PDF, start a run, show live progress, render results. Extracts PDF text client-side (as in the POC). Hosted on Streamlit Community Cloud. |
+| **API Gateway + run API Lambda** | Thin, fast API that starts a run and returns a `run_id`, then serves run status/results. Keeps the POC's `X-API-Key` auth. Never waits on the agent, so the 29-second limit stops mattering. |
+| **DynamoDB (runs table)** | One item per run: status, progress events, final structured report. TTL expires old runs. |
+| **AgentCore Runtime** | Hosts the agent as a container and runs it for as long as a run takes. Session isolation per run. |
+| **Strands Agents SDK** | The agent loop, tool definitions and structured output, written in Python. Runs locally and in AgentCore with the same code. |
+| **Amazon Bedrock** | Nova Pro as the reasoning model (swappable, see below). Titan Text Embeddings V2 (1024 dimensions) for vectors. |
+| **Pinecone** | Vector store, unchanged from the POC. |
+| **EPO OPS API** | Source of patent search and full text. |
+| **Secrets Manager** | Pinecone and EPO credentials, replacing `.env` in deployed environments. |
+| **AgentCore Observability / CloudWatch** | Traces of every model call and tool call per run. |
+| **ECR** | Stores the agent container image. |
 
----
+### Run lifecycle
 
-## Project Structure
+```mermaid
+sequenceDiagram
+    participant UI as Streamlit UI
+    participant API as Run API (Lambda)
+    participant DB as DynamoDB
+    participant AG as Agent (AgentCore Runtime)
 
-```
-patent-prior-art-rag/
-├── src/
-│   ├── ingestion/
-│   │   ├── epo_client.py        # EPO OPS API client
-│   │   ├── patent_parser.py     # Structure-aware XML parser
-│   │   ├── chunker.py           # Atomic claim chunker
-│   │   ├── embedder.py          # Bedrock Titan embeddings
-│   │   ├── pinecone_store.py    # Pinecone ingestion
-│   │   └── ingest.py            # Full ingestion pipeline
-│   ├── extraction/
-│   │   └── extractor.py         # Invention concept extraction
-│   ├── retrieval/
-│   │   ├── epo_search.py        # EPO CQL search
-│   │   └── retriever.py         # Semantic retrieval pipeline
-│   ├── mapping/
-│   │   └── mapper.py            # Element-by-element claim mapping
-│   ├── evaluation/
-│   │   └── evaluator.py         # RAGAS evaluation pipeline
-│   ├── api/
-│   │   └── handler.py           # FastAPI + Lambda handler
-│   └── ui/
-│       └── app.py               # Streamlit three-panel UI
-├── tests/
-│   ├── test_epo_client.py
-│   ├── test_patent_parser.py
-│   ├── test_chunker.py
-│   ├── test_ingestion.py
-│   ├── test_extractor.py
-│   ├── test_retriever.py
-│   ├── test_mapper.py
-│   └── test_evaluator.py
-├── .env                         # Credentials (never committed)
-├── .gitignore
-└── requirements.txt
+    UI->>API: POST /runs {patent_text, limits}
+    API->>DB: create run (status=queued)
+    API->>AG: invoke(run_id, patent_text)
+    API-->>UI: 202 {run_id}
+    loop agent works
+        AG->>DB: append progress event
+        UI->>API: GET /runs/{run_id}
+        API->>DB: read run
+        API-->>UI: status + progress
+    end
+    AG->>DB: final report (status=complete)
+    UI->>API: GET /runs/{run_id}
+    API-->>UI: final report
 ```
 
 ---
 
-## Getting Started
+## The agent
 
-### Prerequisites
+### Tools
 
-- Python 3.11+
-- AWS account with Bedrock access (Nova Pro + Titan Embeddings V2)
-- Pinecone free account with an index named `patent-prior-art` (1024 dimensions, cosine, dense)
-- EPO OPS API account (ops.epo.org)
+Each tool is a plain Python function with a typed signature and docstring. Most wrap POC code.
 
-### Installation
-
-```bash
-git clone https://github.com/VerneCorpTechnologies/patent-prior-art-rag.git
-cd patent-prior-art-rag
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Configuration
-
-Create a `.env` file in the project root:
-
-```bash
-# AWS
-AWS_REGION=us-east-1
-AWS_PROFILE=your-aws-profile
-
-# Pinecone
-PINECONE_API_KEY=your_pinecone_api_key
-PINECONE_INDEX_NAME=patent-prior-art
-
-# EPO OPS API
-EPO_CONSUMER_KEY=your_epo_consumer_key
-EPO_CONSUMER_SECRET=your_epo_consumer_secret
-```
-
-### Run Locally
-
-```bash
-PYTHONPATH=. streamlit run src/ui/app.py
-```
-
----
-
-## Running Tests
-
-Run individual tests:
-
-```bash
-PYTHONPATH=. python3 tests/test_epo_client.py
-PYTHONPATH=. python3 tests/test_patent_parser.py
-PYTHONPATH=. python3 tests/test_chunker.py
-PYTHONPATH=. python3 tests/test_ingestion.py
-PYTHONPATH=. python3 tests/test_extractor.py
-PYTHONPATH=. python3 tests/test_retriever.py
-PYTHONPATH=. python3 tests/test_mapper.py
-PYTHONPATH=. python3 tests/test_evaluator.py
-```
-
-### RAGAS Evaluation Results
-
-| Metric | Score | Description |
+| Tool | Purpose | Source in POC |
 |---|---|---|
-| Faithfulness | 0.833 | Answers grounded in retrieved patent text |
-| Answer Relevancy | 0.280 | Answer relevance to the question |
-| Context Precision | 0.667 | Retrieved chunks relevance |
-| Context Recall | 0.333 | Coverage of relevant chunks |
+| `search_epo(cql)` | Run a CQL query, return candidate patent numbers. | `retrieval/epo_search.py` |
+| `ingest_patent(patent_number)` | Fetch, parse, chunk, embed and store a patent. Idempotent. | `ingestion/ingest.py` |
+| `semantic_search(query, patent_numbers)` | Query Pinecone, filtered to the given patents. | `retrieval/retriever.py` |
+| `get_patent_claims(patent_number)` | Return the full claim set for deep reading. | `ingestion/epo_client.py` + `patent_parser.py` |
+| `record_mapping(...)` | Submit one patent's structured mapping. Validated before it is accepted (see below). | new, replaces `mapping/mapper.py` |
+
+Concept extraction is the agent's first reasoning step, returning the same `concept` / `elements` / `problem` structure as the POC, not a separate tool.
+
+### Behaviour
+
+1. **Understand.** Extract the concept, key elements and problem from the draft.
+2. **Plan searches.** Write several CQL queries at different breadths, not one.
+3. **Search and adapt.** If a query returns too few or irrelevant candidates, broaden or rephrase and retry, up to a limit.
+4. **Ingest and rank.** Ingest the top candidates (capped) and run scoped semantic search.
+5. **Read deeper.** For the most promising patents, fetch the full claim set.
+6. **Map.** For each retained patent, assess every element as `prior_art`, `ambiguous` or `novel` with a quote and a one-sentence explanation. Then set a risk level.
+7. **Report.** Return a structured report. If nothing relevant was found, say so and describe the searches tried.
+
+### Guardrails (enforced in code, not in the prompt)
+
+- Maximum number of tool calls and model turns per run.
+- Maximum EPO searches (default 5) and patents ingested (default 10).
+- Per-run wall-clock timeout.
+- **Evidence validation:** `record_mapping` rejects any quote that is not a substring of text actually retrieved in this run. The agent must correct it or mark the element `ambiguous`.
+- A run that finds nothing returns an explicit "search may be inadequate" result, never a bare "low risk".
+
+### Output schema
+
+The final report is a Pydantic model, so the UI and tests depend on a fixed shape: the extraction, a list of per-patent mappings (patent number, risk level, overall assessment, per-element status/evidence/explanation), and a search log (queries tried, candidates found).
 
 ---
 
-## How It Works
+## Technology choices
 
-### Step 1 — Extract
-The attorney uploads a their patent specification in PDF format. Amazon Nova Pro extracts:
-- The core inventive concept in 2-3 plain English sentences
-- Key functional elements as a structured list
-- The problem the invention solves
+| Choice | Decision | Reasoning |
+|---|---|---|
+| Agent framework | **Strands Agents SDK** | Tools are ordinary Python, the loop is debuggable locally, and the code is portable. |
+| Hosting | **Amazon Bedrock AgentCore Runtime** | Built for long-running agent sessions, which removes the API Gateway timeout problem. |
+| Model | **Amazon Nova Pro** (default) | Continuity with the POC. Strands allows swapping to another Bedrock model with a one-line change if Nova's tool-calling is weak. |
+| Embeddings / vector store | Titan V2 (1024-d) + Pinecone | Unchanged. No reason to churn. |
+| Run API | API Gateway + Lambda + DynamoDB | Small, cheap, and keeps the UI decoupled from the agent runtime. |
+| IaC | **AWS CDK (Python)** for API, DynamoDB, secrets, ECR. | Proposed. The AgentCore Runtime deployment tool may be used for the runtime itself. |
+| Evaluation | RAGAS for retrieval quality, plus trajectory checks | See below. |
 
-### Step 2 — Retrieve
-The extracted concept (not raw claim text) is embedded using Titan Embeddings V2 and used to:
-1. Build a CQL query to search the EPO OPS API for candidate patents
-2. Ingest candidate patents into Pinecone with structure-aware chunking
-3. Run semantic similarity search to find the most relevant prior art chunks
+The model, IaC choice and run-API shape are proposals, not settled decisions.
 
-### Step 3 — Map
-For each retrieved prior art patent, Nova Pro produces:
-- Element-by-element comparison against the client's claims
-- Evidence quotes from the prior art
-- Colour-coded novelty status per element: 🔴 Prior Art / 🟡 Ambiguous / 🟢 Novel
-- Overall risk assessment: High / Medium / Low
-  
+### Evaluation
+
+The POC's RAGAS scores were weak (answer relevancy 0.28, context recall 0.33) and came from only 3 questions about one patent. For the agent:
+- Grow the golden set to several input patents with known relevant prior art.
+- Keep RAGAS for retrieval and answer quality.
+- Add trajectory checks: did the agent retry after an empty search, stay within its limits, and produce only validated quotes?
+- Compare against the POC pipeline on the same inputs, to confirm the agent is actually better.
+
 ---
 
-## 👤 Author
+## Security
+
+- API Gateway requires an API key (carried over from the POC); CORS to be restricted to the Streamlit origin instead of `*`.
+- Agent runtime IAM role limited to: invoking the two Bedrock models, reading its secrets, writing to the runs table.
+- Secrets live in Secrets Manager, not in the image or environment files.
+- Uploaded patent text is stored only in the runs table, with a TTL.
+
+---
+
+## Roadmap
+
+1. **Local agent.** Strands agent running locally with the existing functions as tools. Decide from real runs whether the agent beats the POC.
+2. **Hardening.** Guardrails, evidence validation, structured output, fixes to the claim parser and Pinecone scoping.
+3. **Evaluation.** Expanded golden set and trajectory checks.
+4. **AWS deployment.** AgentCore Runtime, run API, DynamoDB, Secrets Manager, observability, via CDK.
+5. **UI.** Update Streamlit to start runs, poll for progress, and render the report and search log.
+
+Deploy only if step 1 shows the agent is worth it.
+
+---
+
+## Assumptions to verify
+
+This design was written from memory of AWS's agent services, not from current docs. Check before building:
+
+- Nova Pro tool-calling quality, and its support in Strands and AgentCore in `us-east-1`.
+- AgentCore Runtime: maximum run duration, how an async/background run is started, container requirements (architecture, entrypoint contract), pricing, and regional availability.
+- Invocation auth from a Lambda to AgentCore Runtime (IAM/SigV4 versus OAuth).
+- Whether Strands structured output works with Nova models.
+- Whether API Gateway is needed at all, or a Lambda Function URL would do.
+
+## Open questions
+
+- Should the agent's search also use CPC classification codes and applicant/inventor filters, not just keywords?
+- How should the UI show uncertainty when the search is inadequate?
+- Is DynamoDB polling good enough, or is streaming worth the extra complexity?
+- How many input patents do we need in the golden set before evaluation results mean anything?
+
+---
+
+## Carried over from the POC
+
+**Concept-first retrieval.** The agent searches on the extracted inventive concept, not raw claim text. Claims are written in broad, abstract legal language, so retrieving on them finds similar phrasing rather than similar inventions.
+
+**Structure-aware chunking.** Each claim is an atomic chunk, never split mid-sentence.
+
+**Serverless.** No idle servers; cost scales with use.
+
+The POC's setup, configuration and test instructions remain valid for the existing code in `src/` until it is converted. See the [POC repo](https://github.com/VerneCorpTechnologies/patent-prior-art-rag) for them.
+
+---
+
+## Author
 
 David Verne — [LinkedIn](https://linkedin.com/in/david-verne-329385103)
